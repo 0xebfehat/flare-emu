@@ -27,8 +27,9 @@ import re
 import flare_emu_hooks
 import types
 import sys
-
-
+import idc
+import idaapi
+import idautils
 
 PAGESIZE = 0x1000
 PAGEALIGNCHECK = 0xfff
@@ -696,7 +697,7 @@ class EmuHelper():
 
         self.uc.mem_write(addr, data)
         
-    def hexString(self, va):
+    def hexString(self, va) -> str:
         if va > 0xffffffff:
             return "%016X" % va
         else:
@@ -706,6 +707,17 @@ class EmuHelper():
         if v & PAGEALIGNCHECK != 0:
             v += PAGESIZE - (v % PAGESIZE)
         return v
+
+    # returns string of bytes from the IDB up to a null terminator, starting at addr, do not necessarily need to be printable
+    # characters
+    def getIDBString(self, addr):
+        buf = b""
+        while idc.get_bytes(addr, 1, False) != b"\x00" and idc.get_bytes(addr, 1, False) is not None:
+            buf += idc.get_bytes(addr, 1, False)
+            tmp = idc.get_bytes(addr, 1, False)
+            addr += 1
+
+        return str(buf)
 
     # determines if the instruction at addr is for returning from a function call
     def isRetInstruction(self, addr):
@@ -1827,63 +1839,37 @@ class EmuHelper():
     # this instruction hook is used by the iterate feature, forces execution down a specified path
     def _guidedHook(self, uc, address, size, userData):
         
-        try:
-            userData['currAddr'] = address
-            userData['currAddrSize'] = size
-            if self.arch == unicorn.UC_ARCH_ARM and userData["changeThumbMode"]:
-                self._handleThumbMode(address)
-                userData["changeThumbMode"] = False
+        #try:
+        userData['currAddr'] = address
+        userData['currAddrSize'] = size
+        if self.arch == unicorn.UC_ARCH_ARM and userData["changeThumbMode"]:
+            self._handleThumbMode(address)
+            userData["changeThumbMode"] = False
+            return
+        if self.verbose > 0:
+            if self.verbose > 1:
+                self.logger.debug(self.getEmuState())
+            dis = self.analysisHelper.getDisasmLine(address)
+            self.logger.debug("%s: %s" % (self.hexString(address), dis))
+        if self.arch == unicorn.UC_ARCH_ARM:
+            # since there are lots of bad branches during emulation and we are forcing it anyways
+            if self.analysisHelper.getMnem(address)[:3].upper() in ["TBB", "TBH"]:
+                # skip over interleaved jump table
+                nextInsnAddr = self.analysisHelper.skipJumpTable(address + size)
+                self.changeProgramCounter(userData, nextInsnAddr)
                 return
-            if self.verbose > 0:
-                if self.verbose > 1:
-                    self.logger.debug(self.getEmuState())
-                dis = self.analysisHelper.getDisasmLine(address)
-                self.logger.debug("%s: %s" % (self.hexString(address), dis))
-            if self.arch == unicorn.UC_ARCH_ARM:
-                # since there are lots of bad branches during emulation and we are forcing it anyways
-                if self.analysisHelper.getMnem(address)[:3].upper() in ["TBB", "TBH"]:
-                    # skip over interleaved jump table
-                    nextInsnAddr = self.analysisHelper.skipJumpTable(address + size)
-                    self.changeProgramCounter(userData, nextInsnAddr)
-                    return
-            elif userData.get("strict", True) and self._isBadBranch(userData):
-                self.skipInstruction(userData)
-                return
+        elif userData.get("strict", True) and self._isBadBranch(userData):
+            self.skipInstruction(userData)
+            return
 
-            flow, paths = userData["targetInfo"][userData["targetVA"]]
-            # check if we are out of our block bounds or re-entering our block in a loop
-            bbEnd = flow[paths[self.pathIdx][self.blockIdx]][1]
-            bbStart = flow[paths[self.pathIdx][self.blockIdx]][0]
-            if address == bbStart and self.enteredBlock is True:
-                if self.blockIdx < len(paths[self.pathIdx]) - 1:
-                    self.logger.debug("loop re-entering block #%d (%s -> %s), forcing PC to %s" %
-                                  (self.blockIdx, self.hexString(bbStart), self.hexString(bbEnd),
-                                   self.hexString(flow[paths[self.pathIdx][self.blockIdx + 1]][0])))
-                    # force PC to follow paths
-                    uc.reg_write(self.regs["pc"], flow[paths[self.pathIdx][self.blockIdx + 1]][0])
-                    self.blockIdx += 1
-                    self.enteredBlock = False
-                    if self.arch == unicorn.UC_ARCH_ARM:
-                        userData["changeThumbMode"] = True
-                    return
-                else:
-                    self.logger.debug(
-                        "loop re-entering block #%d (%s -> %s), but no more blocks! bailing out of this function.." %
-                        (self.blockIdx, self.hexString(bbStart), self.hexString(bbEnd)))
-                    self.stopEmulation(userData)
-                    return
-            elif (address > bbEnd or address < bbStart):
-                # check if we skipped over our target (our next block index is out of range), this can happen in ARM
-                # with conditional instructions
-                if self.blockIdx + 1 >= len(paths[self.pathIdx]):
-                    self.logger.debug(
-                        "we missed our target! bailing out of this function..")
-                    self.stopEmulation(userData)
-                    return
-                self.logger.debug("%s is outside of block #%d (%s -> %s), forcing PC to %s" %
-                              (self.hexString(address),
-                               self.blockIdx, self.hexString(bbStart),
-                               self.hexString(bbEnd), 
+        flow, paths = userData["targetInfo"][userData["targetVA"]]
+        # check if we are out of our block bounds or re-entering our block in a loop
+        bbEnd = flow[paths[self.pathIdx][self.blockIdx]][1]
+        bbStart = flow[paths[self.pathIdx][self.blockIdx]][0]
+        if address == bbStart and self.enteredBlock is True:
+            if self.blockIdx < len(paths[self.pathIdx]) - 1:
+                self.logger.debug("loop re-entering block #%d (%s -> %s), forcing PC to %s" %
+                              (self.blockIdx, self.hexString(bbStart), self.hexString(bbEnd),
                                self.hexString(flow[paths[self.pathIdx][self.blockIdx + 1]][0])))
                 # force PC to follow paths
                 uc.reg_write(self.regs["pc"], flow[paths[self.pathIdx][self.blockIdx + 1]][0])
@@ -1892,74 +1878,100 @@ class EmuHelper():
                 if self.arch == unicorn.UC_ARCH_ARM:
                     userData["changeThumbMode"] = True
                 return
-            
-            if address == bbStart:
-                self.enteredBlock = True
-            # possibly a folded instruction or invalid instruction
-            if self.analysisHelper.getMnem(address) == "":
-                if self.analysisHelper.getMnem(address + size) == "":
-                    if self.analysisHelper.getMnem(address + size * 2) == "":
-                        self.logger.debug(
-                            "invalid instruction encountered @%s, bailing.." % self.hexString(address))
-                        self.stopEmulation(userData)
-                    return
-                return
-
-            # stop annoying run ons if we end up somewhere we dont belong
-            if self.uc.mem_read(address, 0x10) == b"\x00" * 0x10:
-                self.logger.debug("pc ended up in null memory @%s" %
-                              self.hexString(address))
+            else:
+                self.logger.debug(
+                    "loop re-entering block #%d (%s -> %s), but no more blocks! bailing out of this function.." %
+                    (self.blockIdx, self.hexString(bbStart), self.hexString(bbEnd)))
                 self.stopEmulation(userData)
                 return
-            
-            # this is our stop, this is where we trigger user-defined callback with our info
-            if address == userData["targetVA"]:
-                self.logger.debug("target %s hit" %
-                              self.hexString(userData["targetVA"]))
-                self._targetHit(address, userData)
+        elif (address > bbEnd or address < bbStart):
+            # check if we skipped over our target (our next block index is out of range), this can happen in ARM
+            # with conditional instructions
+            if self.blockIdx + 1 >= len(paths[self.pathIdx]):
+                self.logger.debug(
+                    "we missed our target! bailing out of this function..")
                 self.stopEmulation(userData)
-            elif address in userData["targetInfo"]:
-                # this address is another target in the dict, process it and continue onward
-                self.logger.debug("target %s found on the way to %s, processing" % (
-                    self.hexString(address), self.hexString(userData["targetVA"])))
-                self._targetHit(address, userData)
-
-            if (self.analysisHelper.getMnem(address).upper() in self.callMnems or
-                (self.analysisHelper.getMnem(address).upper() == "B" and
-                 self.analysisHelper.getNameAddr(self.analysisHelper.getOperand(address, 0)) ==
-                 self.analysisHelper.getFuncStart(
-                 self.analysisHelper.getNameAddr(self.analysisHelper.getOperand(address, 0))))):
-                 
-                funcName = self.getCallTargetName(address)
-                if userData["callHook"]:
-                    userData["callHook"](address, self.getArgv(), funcName, userData)
-
-                if self.arch == unicorn.UC_ARCH_ARM:
-                    userData["changeThumbMode"] = True
-
-                # if the pc has been changed by the hook, don't skip instruction and undo the change
-                if self.getRegVal("pc") != userData["currAddr"]:
-                    # get SP delta value for next instruction to adjust stack accordingly since we are skipping this
-                    # instruction
-                    uc.reg_write(self.regs["sp"], self.getRegVal("sp") +
-                                 self.analysisHelper.getSpDelta(self.getRegVal("pc")))
-                    return
-                
-                if userData["hookApis"] and self._handleApiHooks(address, self.getArgv(), funcName, userData):
-                    return
-                    
-                # if you change the program counter, it undoes your call to emu_stop()
-                if address != userData["targetVA"]:
-                    self.skipInstruction(userData)
-                    
-            elif self.isRetInstruction(address):
-                # self.stopEmulation(userData)
-                self.skipInstruction(userData)
                 return
+            self.logger.debug("%s is outside of block #%d (%s -> %s), forcing PC to %s" %
+                          (self.hexString(address),
+                           self.blockIdx, self.hexString(bbStart),
+                           self.hexString(bbEnd), 
+                           self.hexString(flow[paths[self.pathIdx][self.blockIdx + 1]][0])))
+            # force PC to follow paths
+            uc.reg_write(self.regs["pc"], flow[paths[self.pathIdx][self.blockIdx + 1]][0])
+            self.blockIdx += 1
+            self.enteredBlock = False
+            if self.arch == unicorn.UC_ARCH_ARM:
+                userData["changeThumbMode"] = True
+            return
+        
+        if address == bbStart:
+            self.enteredBlock = True
+        # possibly a folded instruction or invalid instruction
+        if self.analysisHelper.getMnem(address) == "":
+            if self.analysisHelper.getMnem(address + size) == "":
+                if self.analysisHelper.getMnem(address + size * 2) == "":
+                    self.logger.debug(
+                        "invalid instruction encountered @%s, bailing.." % self.hexString(address))
+                    self.stopEmulation(userData)
+                return
+            return
 
-        except Exception as e:
-            self.logger.error("exception in _guidedHook @%s: %s" % (self.hexString(address), e))
+        # stop annoying run ons if we end up somewhere we dont belong
+        if self.uc.mem_read(address, 0x10) == b"\x00" * 0x10:
+            self.logger.debug("pc ended up in null memory @%s" %
+                          self.hexString(address))
             self.stopEmulation(userData)
+            return
+        
+        # this is our stop, this is where we trigger user-defined callback with our info
+        if address == userData["targetVA"]:
+            self.logger.debug("target %s hit" %
+                          self.hexString(userData["targetVA"]))
+            self._targetHit(address, userData)
+            self.stopEmulation(userData)
+        elif address in userData["targetInfo"]:
+            # this address is another target in the dict, process it and continue onward
+            self.logger.debug("target %s found on the way to %s, processing" % (
+                self.hexString(address), self.hexString(userData["targetVA"])))
+            self._targetHit(address, userData)
+
+        if (self.analysisHelper.getMnem(address).upper() in self.callMnems or
+            (self.analysisHelper.getMnem(address).upper() == "B" and
+             self.analysisHelper.getNameAddr(self.analysisHelper.getOperand(address, 0)) ==
+             self.analysisHelper.getFuncStart(
+             self.analysisHelper.getNameAddr(self.analysisHelper.getOperand(address, 0))))):
+             
+            funcName = self.getCallTargetName(address)
+            if userData["callHook"]:
+                userData["callHook"](address, self.getArgv(), funcName, userData)
+
+            if self.arch == unicorn.UC_ARCH_ARM:
+                userData["changeThumbMode"] = True
+
+            # if the pc has been changed by the hook, don't skip instruction and undo the change
+            if self.getRegVal("pc") != userData["currAddr"]:
+                # get SP delta value for next instruction to adjust stack accordingly since we are skipping this
+                # instruction
+                uc.reg_write(self.regs["sp"], self.getRegVal("sp") +
+                             self.analysisHelper.getSpDelta(self.getRegVal("pc")))
+                return
+            
+            if userData["hookApis"] and self._handleApiHooks(address, self.getArgv(), funcName, userData):
+                return
+                
+            # if you change the program counter, it undoes your call to emu_stop()
+            if address != userData["targetVA"]:
+                self.skipInstruction(userData)
+                
+        elif self.isRetInstruction(address):
+            # self.stopEmulation(userData)
+            self.skipInstruction(userData)
+            return
+
+        #except Exception as e:
+        #    self.logger.error("exception in _guidedHook @%s: %s" % (self.hexString(address), e))
+        #    self.stopEmulation(userData)
 
 
     # checks ARM mode for address and aligns address accordingly
